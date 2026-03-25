@@ -8,4 +8,4 @@ To switch to a branch from the command-line, use the following commmand
 ```
 $ git checkout <branch name>
 ```
-where <branch name> is the name of the branch.
+where \<branch name\> is the name of the branch.

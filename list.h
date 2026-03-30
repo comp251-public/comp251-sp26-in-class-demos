@@ -7,8 +7,17 @@ typedef struct node_s {
   struct node_s *next;
 } node_t;
 
-step_t *insert_at(step_t *parent, step_t *new_step);
-step_t *remove_next(step_t *parent);
+typedef struct {
+  node_t *start;
+  node_t *end;
+  int size;
+} list_t;
 
+list_t *create_list();
+
+node_t *create_node(char *id, void *data);
+node_t *append(list_t *list, node_t *new_node);
+node_t *insert_at(list_t *list, node_t *parent, node_t *new_node);
+node_t *remove_next(node_t *parent);
 
 #endif

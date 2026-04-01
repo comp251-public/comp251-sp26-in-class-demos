@@ -108,13 +108,19 @@ static void init_random_indices(uint32_t *arr, size_t n) {
     }
 }
 
-static double bench_cache(size_t array_bytes, int accesses) {
+/* bench_cache: pointer-chase benchmark averaged over multiple trials.
+ *
+ * Allocation and initialization are performed once before the trials loop
+ * so that large-array init cost is not multiplied by the trial count.
+ * Each trial restarts from index 0 so that it follows the same
+ * pseudo-random permutation through already-warm data. */
+static double bench_cache(size_t array_bytes, int accesses, int trials) {
     size_t n = array_bytes / sizeof(uint32_t);
     uint32_t *arr;
     uint32_t sum = 0, idx = 0;
-    long long t0, t1;
+    long long t0, t1, total_ns = 0;
     size_t i;
-    int j;
+    int j, t;
 
     arr = (uint32_t *)malloc(array_bytes);
     if (arr == NULL) {
@@ -133,17 +139,23 @@ static double bench_cache(size_t array_bytes, int accesses) {
     for (i = 0; i < n; i++) sum += arr[i];
     v_sink = sum;   /* prevent dead-code elimination of the warmup */
 
-    /* Timed pointer-chase pass: each iteration's address is
+    /* Timed pointer-chase trials: each iteration's address is
      * unknown until the previous load completes, defeating
-     * hardware prefetching and exposing raw load latency. */
-    t0 = get_time_ns();
-    for (j = 0; j < accesses; j++) idx = arr[idx];
-    t1 = get_time_ns();
+     * hardware prefetching and exposing raw load latency.
+     * Running multiple trials and averaging reduces noise from
+     * OS interrupts and transient cache evictions. */
+    for (t = 0; t < trials; t++) {
+        idx = 0;   /* restart from element 0 so each trial is comparable */
+        t0 = get_time_ns();
+        for (j = 0; j < accesses; j++) idx = arr[idx];
+        t1 = get_time_ns();
+        total_ns += (t1 - t0);
+    }
 
     v_sink = idx;   /* prevent dead-code elimination of the timed loop */
     free(arr);
 
-    return (double)(t1 - t0) / accesses;
+    return (double)total_ns / ((long long)trials * accesses);
 }
 
 /* ============================================================
@@ -235,7 +247,7 @@ static int run_sweep(size_t *boundaries) {
         printf("  %8s  ", sz_buf);
         fflush(stdout);
 
-        lat = bench_cache(SWEEP_SIZES[i], sweep_iters(SWEEP_SIZES[i]));
+        lat = bench_cache(SWEEP_SIZES[i], sweep_iters(SWEEP_SIZES[i]), 1);
         if (lat < 0.0) {
             printf("(malloc failed -- stopping sweep)\n");
             break;
@@ -499,25 +511,25 @@ int main(void) {
         format_size(sz_l1, sz_buf);
         snprintf(label, sizeof(label), "L1 Cache    (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
-        l1_ns = bench_cache(sz_l1, 5000000);
+        l1_ns = bench_cache(sz_l1, 5000000, 20);
         printf("%9.2f ns/acc  pointer chase, fits in L1\n", l1_ns);
 
         format_size(sz_l2, sz_buf);
         snprintf(label, sizeof(label), "L2 Cache    (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
-        l2_ns = bench_cache(sz_l2, 2000000);
+        l2_ns = bench_cache(sz_l2, 2000000, 20);
         printf("%9.2f ns/acc  pointer chase, fits in L2\n", l2_ns);
 
         format_size(sz_llc, sz_buf);
         snprintf(label, sizeof(label), "LLC         (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
-        llc_ns = bench_cache(sz_llc, 500000);
+        llc_ns = bench_cache(sz_llc, 500000, 10);
         printf("%9.2f ns/acc  pointer chase, fits in LLC\n", llc_ns);
 
         format_size(sz_ram, sz_buf);
         snprintf(label, sizeof(label), "Main Memory (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
-        ram_ns = bench_cache(sz_ram, 200000);
+        ram_ns = bench_cache(sz_ram, 200000, 10);
         printf("%9.2f ns/acc  pointer chase, random DRAM access\n", ram_ns);
     }
 

@@ -200,12 +200,21 @@ static int sweep_iters(size_t bytes) {
     return 100000;
 }
 
-/* Format a byte count as a human-readable string (e.g., "4 KB"). */
-static void format_size(size_t bytes, char *buf, size_t buflen) {
+/* Minimum buffer size required by format_size() -- the longest
+ * possible output is e.g. "9999 MB\0" = 8 bytes; 16 gives margin. */
+#define SIZE_BUF_BYTES 16
+
+/* Write a human-readable size string (e.g., "   4 KB", " 256 MB")
+ * into buf.  buf must point to at least SIZE_BUF_BYTES bytes.
+ *
+ * We cast to unsigned int (%u) rather than using size_t (%zu) to
+ * give the compiler a provably bounded value.  All sweep sizes fit
+ * comfortably in unsigned int (max value: 256 for 256 MB).        */
+static void format_size(size_t bytes, char *buf) {
     if (bytes >= 1024UL*1024)
-        snprintf(buf, buflen, "%4zu MB", bytes / (1024UL*1024));
+        sprintf(buf, "%4u MB", (unsigned int)(bytes / (1024UL*1024)));
     else
-        snprintf(buf, buflen, "%4zu KB", bytes / 1024);
+        sprintf(buf, "%4u KB", (unsigned int)(bytes / 1024));
 }
 
 /* Run the sweep, print one row per size (with transition annotations),
@@ -222,7 +231,7 @@ static int run_sweep(size_t *boundaries) {
     printf("  ------------------------\n");
 
     for (i = 0; i < NUM_SWEEP; i++) {
-        format_size(SWEEP_SIZES[i], sz_buf, sizeof(sz_buf));
+        format_size(SWEEP_SIZES[i], sz_buf);
         printf("  %8s  ", sz_buf);
         fflush(stdout);
 
@@ -463,7 +472,7 @@ int main(void) {
     } else {
         int k;
         for (k = 0; k < nb; k++) {
-            format_size(boundaries[k], sz_buf, sizeof(sz_buf));
+            format_size(boundaries[k], sz_buf);
             printf("  L%d ~%s", k+1, sz_buf);
         }
         printf("\n");
@@ -487,25 +496,25 @@ int main(void) {
          * is correct regardless of how wide the size string is. */
         char label[40];
 
-        format_size(sz_l1, sz_buf, sizeof(sz_buf));
+        format_size(sz_l1, sz_buf);
         snprintf(label, sizeof(label), "L1 Cache    (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
         l1_ns = bench_cache(sz_l1, 5000000);
         printf("%9.2f ns/acc  pointer chase, fits in L1\n", l1_ns);
 
-        format_size(sz_l2, sz_buf, sizeof(sz_buf));
+        format_size(sz_l2, sz_buf);
         snprintf(label, sizeof(label), "L2 Cache    (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
         l2_ns = bench_cache(sz_l2, 2000000);
         printf("%9.2f ns/acc  pointer chase, fits in L2\n", l2_ns);
 
-        format_size(sz_llc, sz_buf, sizeof(sz_buf));
+        format_size(sz_llc, sz_buf);
         snprintf(label, sizeof(label), "LLC         (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
         llc_ns = bench_cache(sz_llc, 500000);
         printf("%9.2f ns/acc  pointer chase, fits in LLC\n", llc_ns);
 
-        format_size(sz_ram, sz_buf, sizeof(sz_buf));
+        format_size(sz_ram, sz_buf);
         snprintf(label, sizeof(label), "Main Memory (%s)", sz_buf);
         printf("  %-28s  ", label); fflush(stdout);
         ram_ns = bench_cache(sz_ram, 200000);

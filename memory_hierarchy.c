@@ -5,6 +5,10 @@
  *   CPU registers -> L1 cache -> L2 cache -> last-level cache (LLC) ->
  *   main memory (DRAM) -> file system -> network (TCP loopback).
  *
+ * Before running the labeled benchmark, the program sweeps array sizes
+ * from 4 KB to 256 MB and looks for latency jumps to automatically
+ * detect the cache level boundaries on the current machine.
+ *
  * Compile:  make
  * Run:      ./memory_hierarchy
  */
@@ -80,16 +84,17 @@ static double bench_register(void) {
  * so the CPU cannot prefetch ahead.  This exposes the raw
  * load-use latency of whichever memory level holds the data.
  *
- * Array sizes map to cache levels:
- *    32 KB  -> fits entirely in L1 data cache
- *   512 KB  -> fits in L2, too large for L1
- *    16 MB  -> fits in last-level cache (LLC), too large for L2
- *   128 MB  -> exceeds all cache levels; accesses hit DRAM
- *
- * A warmup pass runs before timing to ensure the data is
- * resident at the intended cache level (or to fault in pages
- * for the DRAM case).
+ * Warmup strategy: a sequential scan (not pointer-chasing) is
+ * used to warm up the data.  The hardware prefetcher handles
+ * sequential access extremely efficiently, so even a 256 MB
+ * array can be faulted in and loaded in a few milliseconds.
+ * A pointer-chase warmup would require millions of iterations
+ * to touch the same fraction of a large array.
  * ============================================================ */
+
+/* Shared sink used to prevent the compiler from eliminating
+ * warmup loops and timed loops as dead code. */
+static volatile uint32_t v_sink;
 
 /* Fill arr[0..n-1] with pseudo-random indices in [0, n-1].
  * We use an inline LCG instead of rand() because it is much
@@ -106,10 +111,10 @@ static void init_random_indices(uint32_t *arr, size_t n) {
 static double bench_cache(size_t array_bytes, int accesses) {
     size_t n = array_bytes / sizeof(uint32_t);
     uint32_t *arr;
-    uint32_t idx = 0;
-    volatile uint32_t sink;
+    uint32_t sum = 0, idx = 0;
     long long t0, t1;
-    int i;
+    size_t i;
+    int j;
 
     arr = (uint32_t *)malloc(array_bytes);
     if (arr == NULL) {
@@ -119,25 +124,159 @@ static double bench_cache(size_t array_bytes, int accesses) {
 
     init_random_indices(arr, n);
 
-    /* Warmup: bring the data into the target cache level
-     * (or fault in all virtual pages for the DRAM test). */
-    for (i = 0; i < accesses; i++) {
-        idx = arr[idx];
-    }
+    /* Sequential warmup: scan the entire array once so all pages
+     * are faulted in and the data is resident in the appropriate
+     * cache level.  The hardware prefetcher handles sequential
+     * access with near-zero overhead, making this O(n) in time
+     * regardless of array size -- far more efficient than trying
+     * to warm up via the same pointer-chase used for timing. */
+    for (i = 0; i < n; i++) sum += arr[i];
+    v_sink = sum;   /* prevent dead-code elimination of the warmup */
 
-    /* Timed pointer-chase pass. */
+    /* Timed pointer-chase pass: each iteration's address is
+     * unknown until the previous load completes, defeating
+     * hardware prefetching and exposing raw load latency. */
     t0 = get_time_ns();
-    for (i = 0; i < accesses; i++) {
-        idx = arr[idx];
-    }
+    for (j = 0; j < accesses; j++) idx = arr[idx];
     t1 = get_time_ns();
 
-    /* Sink prevents the compiler from eliminating the loop. */
-    sink = idx;
-    (void)sink;
+    v_sink = idx;   /* prevent dead-code elimination of the timed loop */
     free(arr);
 
     return (double)(t1 - t0) / accesses;
+}
+
+/* ============================================================
+ * Cache boundary detection via latency sweep
+ *
+ * We run bench_cache at power-of-2 array sizes from 4 KB to
+ * 256 MB.  When the latency between consecutive sizes jumps by
+ * more than BOUNDARY_RATIO, we have crossed a cache boundary.
+ * The size just before the jump is the capacity of that level.
+ *
+ * This approach requires no OS-specific API and works on any
+ * machine -- the program discovers the hardware topology at
+ * runtime rather than assuming fixed sizes.
+ *
+ * Limitation: the sweep uses powers of 2, so a cache whose
+ * size falls between two sweep points (e.g., a 44 MB LLC
+ * between the 32 MB and 64 MB sweep sizes) cannot be cleanly
+ * isolated.  Its boundary will appear at the nearest power of
+ * 2 below its actual capacity.
+ * ============================================================ */
+
+/* Seventeen sizes from 4 KB to 256 MB, each double the last. */
+#define NUM_SWEEP  17
+#define BOUNDARY_RATIO  2.0   /* relative latency jump that signals a new level */
+
+static const size_t SWEEP_SIZES[NUM_SWEEP] = {
+    4UL*1024,           /*   4 KB */
+    8UL*1024,           /*   8 KB */
+    16UL*1024,          /*  16 KB */
+    32UL*1024,          /*  32 KB */
+    64UL*1024,          /*  64 KB */
+    128UL*1024,         /* 128 KB */
+    256UL*1024,         /* 256 KB */
+    512UL*1024,         /* 512 KB */
+    1024UL*1024,        /*   1 MB */
+    2UL*1024*1024,      /*   2 MB */
+    4UL*1024*1024,      /*   4 MB */
+    8UL*1024*1024,      /*   8 MB */
+    16UL*1024*1024,     /*  16 MB */
+    32UL*1024*1024,     /*  32 MB */
+    64UL*1024*1024,     /*  64 MB */
+    128UL*1024*1024,    /* 128 MB */
+    256UL*1024*1024     /* 256 MB */
+};
+
+/* Scale the iteration count so each sweep point takes roughly
+ * the same wall-clock time, regardless of which cache level
+ * the array falls in. */
+static int sweep_iters(size_t bytes) {
+    if (bytes <=   32UL*1024)         return 4000000;
+    if (bytes <=  512UL*1024)         return 2000000;
+    if (bytes <=    4UL*1024*1024)    return  500000;
+    if (bytes <=   64UL*1024*1024)    return  200000;
+    return 100000;
+}
+
+/* Format a byte count as a human-readable string (e.g., "4 KB"). */
+static void format_size(size_t bytes, char *buf, size_t buflen) {
+    if (bytes >= 1024UL*1024)
+        snprintf(buf, buflen, "%4zu MB", bytes / (1024UL*1024));
+    else
+        snprintf(buf, buflen, "%4zu KB", bytes / 1024);
+}
+
+/* Run the sweep, print one row per size (with transition annotations),
+ * fill boundaries[0..3] with the detected cache capacities, and
+ * return the number of boundaries found.
+ * boundaries[k] is the last sweep size that fits within level k. */
+static int run_sweep(size_t *boundaries) {
+    double prev = 0.0, lat = 0.0;
+    int i, nb = 0;
+    char sz_buf[16];
+    static const char *TRANS[] = {"L1->L2", "L2->LLC", "LLC->DRAM"};
+
+    printf("  %8s  %12s\n", "Array", "Latency");
+    printf("  ------------------------\n");
+
+    for (i = 0; i < NUM_SWEEP; i++) {
+        format_size(SWEEP_SIZES[i], sz_buf, sizeof(sz_buf));
+        printf("  %8s  ", sz_buf);
+        fflush(stdout);
+
+        lat = bench_cache(SWEEP_SIZES[i], sweep_iters(SWEEP_SIZES[i]));
+        if (lat < 0.0) {
+            printf("(malloc failed -- stopping sweep)\n");
+            break;
+        }
+
+        /* Check whether the previous size was a level boundary.
+         * We annotate this row because it is the first row that
+         * belongs to the new (slower) level. */
+        if (prev > 0.0 && lat / prev > BOUNDARY_RATIO && nb < 4) {
+            const char *label = (nb < 3) ? TRANS[nb] : "new level";
+            printf("%9.2f ns  *** %s\n", lat, label);
+            boundaries[nb++] = SWEEP_SIZES[i-1];
+        } else {
+            printf("%9.2f ns\n", lat);
+        }
+        prev = lat;
+    }
+    return nb;
+}
+
+/* Given the detected boundary sizes, pick one representative
+ * array size for each labeled level:
+ *
+ *  L1:   boundaries[0]     -- the largest array that fits in L1
+ *  L2:   boundaries[0]*2   -- one step past L1, within L2
+ *         (capped at boundaries[1] if detected)
+ *  LLC:  boundaries[1]*2   -- one step past L2, within LLC
+ *         (capped at boundaries[2] if detected)
+ *  RAM:  boundaries[nb-1]*4 -- well beyond all cache
+ *         (capped at 256 MB; floored at 64 MB)
+ *
+ * Fallback sizes are used when fewer than the expected number
+ * of boundaries were detected. */
+static void derive_bench_sizes(const size_t *b, int nb,
+                                size_t *l1, size_t *l2,
+                                size_t *llc, size_t *ram) {
+    *l1  = (nb >= 1) ? b[0]          : 32UL*1024;
+    *l2  = (nb >= 1) ? b[0] * 2      : 512UL*1024;
+    *llc = (nb >= 2) ? b[1] * 2      : 16UL*1024*1024;
+    *ram = (nb >= 1) ? b[nb-1] * 4   : 128UL*1024*1024;
+
+    /* Cap l2 so it stays within L2 when an L2 boundary is known. */
+    if (nb >= 2 && *l2 >= b[1]) *l2 = b[1];
+
+    /* Cap llc so it stays within LLC when an LLC boundary is known. */
+    if (nb >= 3 && *llc >= b[2]) *llc = b[2];
+
+    /* Clamp ram to a reasonable range. */
+    if (*ram > 256UL*1024*1024) *ram = 256UL*1024*1024;
+    if (*ram <  64UL*1024*1024) *ram =  64UL*1024*1024;
 }
 
 /* ============================================================
@@ -298,51 +437,87 @@ static double bench_network(void) {
 }
 
 /* ============================================================
- * Main: run all benchmarks and print the results table
+ * Main: sweep to detect cache topology, then run the full
+ *       labeled benchmark using the detected sizes
  * ============================================================ */
 
 int main(void) {
+    size_t boundaries[4];
+    size_t sz_l1, sz_l2, sz_llc, sz_ram;
     double reg_ns, l1_ns, l2_ns, llc_ns, ram_ns, file_us, net_us;
+    char sz_buf[16];
+    int nb;
 
     printf("\n  Memory Hierarchy Latency Demo  --  COMP 251\n");
-    printf("  ==================================================================\n");
-    printf("  %-26s  %13s  %s\n", "Level", "Latency", "Notes");
+
+    /* ---- Step 1: sweep to find cache level boundaries ---- */
+    printf("\n  Sweeping array sizes to detect cache levels on this machine...\n");
+    printf("  (*** marks the first measurement in each new cache level)\n\n");
+
+    nb = run_sweep(boundaries);
+
+    /* Print a plain-English summary of what was found. */
+    printf("\n  Detected %d cache level boundary/boundaries:", nb);
+    if (nb == 0) {
+        printf(" none (using fallback sizes)\n");
+    } else {
+        int k;
+        for (k = 0; k < nb; k++) {
+            format_size(boundaries[k], sz_buf, sizeof(sz_buf));
+            printf("  L%d ~%s", k+1, sz_buf);
+        }
+        printf("\n");
+    }
+
+    /* ---- Step 2: derive benchmark sizes from boundaries ---- */
+    derive_bench_sizes(boundaries, nb, &sz_l1, &sz_l2, &sz_llc, &sz_ram);
+
+    /* ---- Step 3: run the labeled benchmark ---- */
+    printf("\n  ==================================================================\n");
+    printf("  %-28s  %13s  %s\n", "Level", "Latency", "Notes");
     printf("  ------------------------------------------------------------------\n");
 
-    /* Print each label before its benchmark so the user gets live
-     * feedback as measurements run.  The value fills in after. */
-
-    printf("  %-26s  ", "CPU Register (ALU op)");
+    printf("  %-28s  ", "CPU Register (ALU op)");
     fflush(stdout);
     reg_ns = bench_register();
     printf("%9.2f ns/acc  local variable arithmetic\n", reg_ns);
 
-    printf("  %-26s  ", "L1 Cache    (~32 KB)");
-    fflush(stdout);
-    l1_ns = bench_cache(32 * 1024, 5000000);
-    printf("%9.2f ns/acc  pointer chase, array fits in L1\n", l1_ns);
+    {
+        /* Build each label with snprintf so the %-28s padding
+         * is correct regardless of how wide the size string is. */
+        char label[40];
 
-    printf("  %-26s  ", "L2 Cache   (~512 KB)");
-    fflush(stdout);
-    l2_ns = bench_cache(512 * 1024, 2000000);
-    printf("%9.2f ns/acc  pointer chase, array fits in L2\n", l2_ns);
+        format_size(sz_l1, sz_buf, sizeof(sz_buf));
+        snprintf(label, sizeof(label), "L1 Cache    (%s)", sz_buf);
+        printf("  %-28s  ", label); fflush(stdout);
+        l1_ns = bench_cache(sz_l1, 5000000);
+        printf("%9.2f ns/acc  pointer chase, fits in L1\n", l1_ns);
 
-    printf("  %-26s  ", "Last-Level Cache (~16 MB)");
-    fflush(stdout);
-    llc_ns = bench_cache(16 * 1024 * 1024, 500000);
-    printf("%9.2f ns/acc  pointer chase, array fits in LLC\n", llc_ns);
+        format_size(sz_l2, sz_buf, sizeof(sz_buf));
+        snprintf(label, sizeof(label), "L2 Cache    (%s)", sz_buf);
+        printf("  %-28s  ", label); fflush(stdout);
+        l2_ns = bench_cache(sz_l2, 2000000);
+        printf("%9.2f ns/acc  pointer chase, fits in L2\n", l2_ns);
 
-    printf("  %-26s  ", "Main Memory  (~128 MB)");
-    fflush(stdout);
-    ram_ns = bench_cache(128 * 1024 * 1024, 200000);
-    printf("%9.2f ns/acc  pointer chase, random DRAM access\n", ram_ns);
+        format_size(sz_llc, sz_buf, sizeof(sz_buf));
+        snprintf(label, sizeof(label), "LLC         (%s)", sz_buf);
+        printf("  %-28s  ", label); fflush(stdout);
+        llc_ns = bench_cache(sz_llc, 500000);
+        printf("%9.2f ns/acc  pointer chase, fits in LLC\n", llc_ns);
 
-    printf("  %-26s  ", "File System    (1 MB)");
+        format_size(sz_ram, sz_buf, sizeof(sz_buf));
+        snprintf(label, sizeof(label), "Main Memory (%s)", sz_buf);
+        printf("  %-28s  ", label); fflush(stdout);
+        ram_ns = bench_cache(sz_ram, 200000);
+        printf("%9.2f ns/acc  pointer chase, random DRAM access\n", ram_ns);
+    }
+
+    printf("  %-28s  ", "File System    (1 MB)");
     fflush(stdout);
     file_us = bench_file();
     printf("%9.2f us/page  write + fsync + read, per 4 KB page\n", file_us);
 
-    printf("  %-26s  ", "Network (TCP loopback)");
+    printf("  %-28s  ", "Network (TCP loopback)");
     fflush(stdout);
     net_us = bench_network();
     printf("%9.2f us/RTT   %d round trips, 64-byte messages\n",

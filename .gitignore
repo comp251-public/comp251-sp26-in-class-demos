@@ -1,3 +1,6 @@
+# ignored binaries
+memory_hierarchy
+
 # Prerequisites
 *.d
 

@@ -19,6 +19,9 @@ int main(void) {
   pthread_create(&thread1, NULL, add_one, NULL);
   pthread_create(&thread2, NULL, add_one, NULL);
 
+  // question: does this affect the result?
+  // sleep(3);
+
   printf("in main [pid: %d] %d\n", getpid(), g_count);
 
   add_one(NULL);

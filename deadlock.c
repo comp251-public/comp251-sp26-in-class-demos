@@ -1,97 +1,54 @@
+/* CORRECT THIS CODE! */
+
 #include <pthread.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <stdlib.h>
 
-#define N_THREADS 2
-#define N_LOCKS 2
-#define TIMEOUT 1
+pthread_mutex_t m;
+int counter = 0;
 
-typedef struct {
-  pthread_t thread;
-  int id;
-} thread_info_t;
+void *worker(void *arg) {
+  long tid = *(long *)arg; // read thread id from passed-in address
 
-typedef void *(*thread_func_t)(void *);
+  for (int i = 0; i < 10000; i++) {
+    pthread_mutex_lock(&m);
 
-pthread_mutex_t locks[2];
+    /* thread 1 only updates first 5000 */
+    if (tid == 1 && i > 5000) {
+      break;
+    }
 
-void do_task(thread_info_t *thread_info) {
-  printf("[thread %d] started task...\n", thread_info->id);
-  fflush(stdout);
+    printf("thread %ld: counter=%d\n", tid, counter);
+    counter++;
 
-  sleep(TIMEOUT);
-
-  printf("[thread %d] completed task...\n", thread_info->id);
-  fflush(stdout);
-}
-
-void acquire_lock(int id, thread_info_t *thread_info) {
-  printf("[thread %d] attempting to acquire lock %d...\n", thread_info->id, id);
-  fflush(stdout);
-
-  pthread_mutex_lock(&locks[id]);
-
-  printf("[thread %d] acquired lock %d...\n", thread_info->id, id);
-  fflush(stdout);
-}
-
-void release_lock(int id, thread_info_t *thread_info) {
-  printf("[thread %d] releasing lock %d...\n", thread_info->id, id);
-  fflush(stdout);
-
-  pthread_mutex_unlock(&locks[id]);
-}
-
-void *worker1(void *thread_info) {
-  while (1) {
-    acquire_lock(1, thread_info);
-    acquire_lock(2, thread_info);
-
-    do_task(thread_info);
-
-    release_lock(2, thread_info);
-    release_lock(1, thread_info);
+    pthread_mutex_unlock(&m);
   }
 
   return NULL;
 }
 
-void *worker2(void *thread_info) {
-  while (1) {
-    acquire_lock(2, thread_info);
-    acquire_lock(1, thread_info);
+int main(void) {
+  pthread_t t0, t1;
 
-    do_task(thread_info);
+  // thread id variables whose addresses we pass to pthread_create
+  long tid0 = 0;
+  long tid1 = 1;
 
-    release_lock(1, thread_info);
-    release_lock(2, thread_info);
+  if (pthread_mutex_init(&m, NULL) != 0) {
+    fprintf(stderr, "pthread_mutex_init failed\n");
+    return 1;
   }
 
-  return NULL;
-}
-
-int main() {
-  thread_info_t thread_info[N_THREADS];
-  thread_func_t thread_funcs[N_THREADS] = {worker1, worker2};
-
-  int i;
-
-  /* initialize mutexes */
-  for (i = 0; i < N_LOCKS; i++) {
-    pthread_mutex_init(&locks[i], NULL);
+  if (pthread_create(&t0, NULL, worker, &tid0) != 0 ||
+      pthread_create(&t1, NULL, worker, &tid1) != 0) {
+    perror("pthread_create");
+    pthread_mutex_destroy(&m);
+    return 1;
   }
 
-  /* create threads */
-  for (i = 0; i < N_THREADS; i++) {
-    thread_info[i].id = i;
-    pthread_create(&thread_info[i].thread, NULL, thread_funcs[i],
-                   &thread_info[i]);
-  }
+  pthread_join(t0, NULL);
+  pthread_join(t1, NULL);
 
-  /* wait for all threads to complete */
-  for (i = 0; i < N_THREADS; i++) {
-    pthread_join(thread_info[i].thread, NULL);
-  }
-
+  pthread_mutex_destroy(&m);
   return 0;
 }
